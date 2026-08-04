@@ -1,0 +1,139 @@
+import Anthropic from '@anthropic-ai/sdk';
+import { execFileSync } from 'child_process';
+
+const [owner, repo] = process.env.REPO.split('/');
+const pr = process.env.PR_NUMBER;
+const ghToken = process.env.GH_TOKEN;
+
+async function ghFetch(path, opts = {}) {
+  const r = await fetch(`https://api.github.com${path}`, {
+    ...opts,
+    headers: {
+      Authorization: `Bearer ${ghToken}`,
+      Accept: 'application/vnd.github+json',
+      ...opts.headers,
+    },
+  });
+  return opts.headers?.Accept?.includes('diff') ? r.text() : r.json();
+}
+
+function extractFileDiff(diff, filename) {
+  const sections = diff.split(/(?=^diff --git )/m);
+  const section = sections.find(s => s.split('\n')[0].includes(`b/${filename}`));
+  return section ? section.slice(0, 2000) : '(not found in diff)';
+}
+
+// 1. Fetch PR metadata and diff in parallel
+const [prData, rawDiff] = await Promise.all([
+  ghFetch(`/repos/${owner}/${repo}/pulls/${pr}`),
+  ghFetch(`/repos/${owner}/${repo}/pulls/${pr}`, {
+    headers: { Accept: 'application/vnd.github.v3.diff' },
+  }),
+]);
+
+// 2. Parse package name and versions from PR title
+const titleMatch = (prData.title || '').match(/bump (\S+) from ([\d.]+) to ([\d.]+)/i);
+const [, pkg, fromVer, toVer] = titleMatch || ['', 'unknown', '?', '?'];
+
+console.log(`Reviewing bump: ${pkg} ${fromVer} → ${toVer}`);
+
+// 3. Detect bump type from diff file headers
+const diffFiles = [...rawDiff.matchAll(/^diff --git a\/.+ b\/(.+)$/gm)].map(m => m[1]);
+const isGem = diffFiles.some(f => f === 'Gemfile' || f === 'Gemfile.lock');
+const bumpType = isGem ? 'gem' : 'npm';
+
+// 4. Extract only the manifest file diff (skip lock file noise)
+const manifestFile = isGem ? 'Gemfile' : 'package.json';
+const manifestDiff = extractFileDiff(rawDiff, manifestFile);
+
+// 5. Fetch registry metadata (best-effort)
+let registryInfo = '(unavailable)';
+try {
+  if (bumpType === 'npm') {
+    const data = await fetch(`https://registry.npmjs.org/${encodeURIComponent(pkg)}/${toVer}`).then(r => r.json());
+    registryInfo = [
+      data.description,
+      data.deprecated ? `⚠️ DEPRECATED: ${data.deprecated}` : null,
+    ].filter(Boolean).join('\n');
+  } else {
+    const data = await fetch(`https://rubygems.org/api/v1/gems/${pkg}.json`).then(r => r.json());
+    registryInfo = [
+      data.info,
+      data.source_code_uri ? `Source: ${data.source_code_uri}` : null,
+    ].filter(Boolean).join('\n');
+  }
+} catch {
+  // registry lookup is best-effort
+}
+
+// 6. Search codebase for usage of the package
+const grepPatterns = isGem
+  ? ['*.rb', '*.erb', '*.rake', '*.gemspec', '*.ru']
+  : ['*.js', '*.ts', '*.jsx', '*.tsx', '*.mjs', '*.cjs'];
+
+const includeArgs = grepPatterns.map(p => `--include=${p}`);
+let usage = '(no usage found)';
+if (pkg && pkg !== 'unknown') {
+  try {
+    usage = execFileSync('git', ['grep', '-rn', ...includeArgs, pkg], { encoding: 'utf8' }).trim() || '(no usage found)';
+  } catch (error) {
+    // git grep exits 1 when no matches found — not an error
+    usage = error?.status === 1 ? '(no usage found)' : '(grep failed)';
+  }
+}
+
+// 7. Build prompt
+const prompt = `You are reviewing a Dependabot ${isGem ? 'Ruby gem' : 'npm package'} version bump PR.
+
+Package: ${pkg}
+Version bump: ${fromVer} → ${toVer}
+
+Registry info:
+${registryInfo}
+
+Dependabot PR body (may include changelog):
+${(prData.body || '(none)').slice(0, 3000)}
+
+${manifestFile} diff:
+${manifestDiff}
+
+How this package is used in the codebase (grep results, truncated to 2000 chars):
+${usage.slice(0, 2000)}
+
+Write a PR review comment in Markdown with these exact sections:
+
+## 📦 What changed
+One short paragraph summarising the version bump — semver type and the headline changes from the changelog above. If the changelog is missing, say so.
+
+## ⚠️ Impact on this codebase
+Breaking changes or deprecations that affect *this codebase* based on the grep results. Reference specific file paths. If there are no breaking changes or no usage was found, say so and keep this section brief.
+
+## 🔍 Where to look
+Based on the grep results, list the specific files where this package is used. The goal is to tell the developer exactly where to focus — not how to test, just where the relevant code lives so they know what to exercise.
+
+## ✅ Verdict
+One of: **Safe to merge** or **Needs review** — followed by one sentence explaining why.
+
+Be specific to this codebase. Do not give generic advice.`;
+
+// 8. Call Anthropic API
+const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const message = await client.messages.create({
+  model: 'claude-sonnet-4-6',
+  max_tokens: 2048,
+  messages: [{ role: 'user', content: prompt }],
+});
+
+const review = message.content[0].text;
+
+// 9. Post comment to PR
+await ghFetch(`/repos/${owner}/${repo}/issues/${pr}/comments`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    body: `> 🤖 **AI dependency review** — generated by Claude\n\n${review}`,
+  }),
+});
+
+console.log('✅ Review posted successfully.');
