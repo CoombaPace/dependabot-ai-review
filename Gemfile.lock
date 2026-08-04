@@ -137,7 +137,7 @@ GEM
     prettyprint (0.2.0)
     prism (1.9.0)
     racc (1.8.1)
-    rack (3.0.0)
+    rack (3.2.6)
     rack-session (2.1.2)
       base64 (>= 0.1.0)
       rack (>= 3.0.0)
@@ -209,7 +209,7 @@ PLATFORMS
 DEPENDENCIES
   devise (= 4.9.2)
   nokogiri (= 1.15.0)
-  rack (= 3.0.0)
+  rack (= 3.2.6)
   rails (= 7.1.0)
 
 BUNDLED WITH
